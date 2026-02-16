@@ -1,0 +1,53 @@
+# Git files
+.git
+.gitignore
+
+# Reference files
+reference/
+
+# Documentation
+*.md
+README.md
+
+# Python cache
+__pycache__/
+*.py[cod]
+*.pyo
+*.pyd
+.Python
+
+# Virtual environments
+venv/
+env/
+ENV/
+
+# IDE files
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+
+# OS files
+.DS_Store
+Thumbs.db
+
+# Logs
+*.log
+
+# Docker files (don't need these in the image)
+.dockerignore
+
+# Environment files
+.env
+.env.local
+
+# Test files
+tests/
+test_*.py
+*_test.py
+
+# Build artifacts
+build/
+dist/
+*.egg-info/

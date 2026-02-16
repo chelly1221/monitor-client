@@ -1,0 +1,48 @@
+version: '3.8'
+
+services:
+  relay-controller:
+    build: .
+    image: usb-relay-controller:latest
+    container_name: usb-relay-controller
+    restart: unless-stopped
+
+    # USB device access - Option 1: Privileged mode (simpler but less secure)
+    # This gives the container full access to all USB devices
+    privileged: true
+
+    # USB device access - Option 2: Device mapping (more secure, uncomment to use instead of privileged)
+    # You'll need to identify the specific device paths and uncomment these lines
+    # devices:
+    #   - /dev/bus/usb:/dev/bus/usb
+    #   - /dev/hidraw0:/dev/hidraw0  # Adjust based on actual device (use 'ls /dev/hidraw*')
+
+    # Network configuration
+    ports:
+      - "5000:5000/tcp"  # TCP port for relay commands
+      - "5001:5001/udp"  # UDP port for relay commands
+
+    # Mount configuration file and log directory
+    volumes:
+      - ./config.yaml:/app/config.yaml:ro  # Read-only config
+      - relay-logs:/var/log                # Persistent log storage
+
+    # Environment variables
+    environment:
+      - TZ=UTC                    # Timezone
+      - PYTHONUNBUFFERED=1        # Disable Python output buffering
+
+    # Logging configuration
+    logging:
+      driver: "json-file"
+      options:
+        max-size: "10m"           # Maximum log file size
+        max-file: "3"             # Number of log files to keep
+
+    # Network mode (default bridge is fine)
+    # Uncomment below to use host networking instead (bypasses port mapping)
+    # network_mode: "host"
+
+volumes:
+  relay-logs:
+    driver: local

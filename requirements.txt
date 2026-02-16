@@ -1,0 +1,10 @@
+# USB HID Relay Network Controller - Python Dependencies
+
+# Configuration file parsing
+pyyaml>=6.0
+
+# USB HID device communication
+hidapi>=0.14.0
+
+# Async file I/O (for potential future log handling)
+aiofiles>=23.2.1
