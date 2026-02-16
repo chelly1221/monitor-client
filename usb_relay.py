@@ -8,6 +8,11 @@ Key API patterns from reference code:
 - Channel numbering: 1-8 (NOT 0-indexed)
 - Special value 255 = ALL channels
 - Return values: 0=success, 1=error, 2=out of range
+
+HID Protocol Note:
+The reference Windows DLL abstracts the actual HID protocol. This implementation
+uses the common DCTTECH/USBRelay protocol which is compatible with most
+USB HID relays (VID:16c0, PID:05df).
 """
 
 import asyncio
@@ -40,6 +45,9 @@ class USBRelayController:
 
     Provides async interface to control USB HID relay devices.
     Supports 1, 2, 4, or 8 channel relay boards.
+
+    Uses the common DCTTECH/USBRelay HID protocol compatible with
+    most USB HID relays using VID:16c0, PID:05df.
     """
 
     # Standard USB HID Relay VID/PID
@@ -48,11 +56,6 @@ class USBRelayController:
 
     # Special channel value for ALL channels
     ALL_CHANNELS = 255
-
-    # Command codes (based on common HID relay protocols)
-    CMD_OPEN = 0xFF
-    CMD_CLOSE = 0xFD
-    CMD_STATUS = 0x00
 
     def __init__(self, serial_number: str, num_channels: int = 8,
                  auto_reconnect: bool = True, reconnect_interval: int = 5):
@@ -79,6 +82,9 @@ class USBRelayController:
         # Exponential backoff for reconnection
         self._reconnect_delay = reconnect_interval
         self._max_reconnect_delay = 60
+
+        # Cache for current relay state (avoids constant HID queries)
+        self._state_cache: Dict[int, bool] = {}
 
         logger.info(f"Initialized USB Relay Controller for device {serial_number}")
 
@@ -123,6 +129,10 @@ class USBRelayController:
                 self._reconnect_delay = self.reconnect_interval  # Reset backoff
 
                 logger.info(f"Connected to USB relay device: {self.serial_number}")
+
+                # Initialize state cache
+                await self._update_state_cache()
+
                 return True
 
             except Exception as e:
@@ -142,6 +152,7 @@ class USBRelayController:
                 finally:
                     self._device = None
                     self._connected = False
+                    self._state_cache.clear()
 
     def _validate_channel(self, channel: int) -> None:
         """
@@ -162,13 +173,19 @@ class USBRelayController:
                 f"Valid range: 1-{self.num_channels} or {self.ALL_CHANNELS} for all"
             )
 
-    async def _send_command(self, channel: int, command: int) -> bool:
+    async def _send_relay_command(self, channel: int, state: bool) -> bool:
         """
-        Send command to USB relay device
+        Send relay control command using DCTTECH/USBRelay protocol
+
+        Protocol: 9-byte feature report
+        [0] = 0x00 (report ID)
+        [1] = state (0xFE=off, 0xFF=on)
+        [2] = channel number (1-8)
+        [3-8] = 0x00 (padding)
 
         Args:
-            channel: Channel number (1-8 or ALL_CHANNELS)
-            command: Command code (CMD_OPEN or CMD_CLOSE)
+            channel: Channel number (1-8)
+            state: True=ON/OPEN, False=OFF/CLOSED
 
         Returns:
             bool: True if successful
@@ -177,21 +194,24 @@ class USBRelayController:
             raise DeviceNotFoundError("Device not connected")
 
         try:
-            # HID relay command format: [Command, Channel]
-            # For ALL channels, send individual commands to each
-            if channel == self.ALL_CHANNELS:
-                for ch in range(1, self.num_channels + 1):
-                    report = bytes([command, ch])
-                    self._device.write(report)
-                    await asyncio.sleep(0.05)  # Small delay between commands
-            else:
-                report = bytes([command, channel])
-                self._device.write(report)
+            # Build HID feature report (DCTTECH protocol)
+            # Report format: [0x00, state_byte, channel, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00]
+            state_byte = 0xFF if state else 0xFE
+            report = bytes([0x00, state_byte, channel, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00])
+
+            # Send feature report
+            self._device.send_feature_report(report)
+
+            # Small delay for relay to actuate
+            await asyncio.sleep(0.05)
+
+            # Update cache
+            self._state_cache[channel] = state
 
             return True
 
         except Exception as e:
-            logger.error(f"Error sending command to relay: {e}")
+            logger.error(f"Error sending relay command: {e}")
             self._connected = False
             if self.auto_reconnect:
                 asyncio.create_task(self._reconnect_loop())
@@ -210,7 +230,7 @@ class USBRelayController:
         async with self._lock:
             self._validate_channel(channel)
             logger.debug(f"Opening channel {channel}")
-            return await self._send_command(channel, self.CMD_OPEN)
+            return await self._send_relay_command(channel, True)
 
     async def close_channel(self, channel: int) -> bool:
         """
@@ -225,7 +245,7 @@ class USBRelayController:
         async with self._lock:
             self._validate_channel(channel)
             logger.debug(f"Closing channel {channel}")
-            return await self._send_command(channel, self.CMD_CLOSE)
+            return await self._send_relay_command(channel, False)
 
     async def open_all_channels(self) -> bool:
         """
@@ -236,7 +256,11 @@ class USBRelayController:
         """
         async with self._lock:
             logger.debug("Opening all channels")
-            return await self._send_command(self.ALL_CHANNELS, self.CMD_OPEN)
+            success = True
+            for ch in range(1, self.num_channels + 1):
+                if not await self._send_relay_command(ch, True):
+                    success = False
+            return success
 
     async def close_all_channels(self) -> bool:
         """
@@ -247,7 +271,34 @@ class USBRelayController:
         """
         async with self._lock:
             logger.debug("Closing all channels")
-            return await self._send_command(self.ALL_CHANNELS, self.CMD_CLOSE)
+            success = True
+            for ch in range(1, self.num_channels + 1):
+                if not await self._send_relay_command(ch, False):
+                    success = False
+            return success
+
+    async def _update_state_cache(self) -> None:
+        """Update the state cache by reading from device"""
+        if not self._connected or not self._device:
+            return
+
+        try:
+            # Request status using feature report
+            # Send: [0x00, 0x00, 0x00, ...]
+            # Receive: [channel_states, ...]
+            report = self._device.get_feature_report(0x00, 9)
+
+            if report and len(report) > 0:
+                # First byte contains relay states as bit field
+                state_byte = report[0]
+
+                # Update cache: bit 0 = channel 1, bit 1 = channel 2, etc.
+                for ch in range(1, self.num_channels + 1):
+                    bit = ch - 1
+                    self._state_cache[ch] = bool(state_byte & (1 << bit))
+
+        except Exception as e:
+            logger.warning(f"Failed to update state cache: {e}")
 
     async def get_status(self) -> Dict[int, bool]:
         """
@@ -261,33 +312,16 @@ class USBRelayController:
                 raise DeviceNotFoundError("Device not connected")
 
             try:
-                # Request status
-                report = bytes([self.CMD_STATUS])
-                self._device.write(report)
+                # Update cache from device
+                await self._update_state_cache()
 
-                # Read response
-                await asyncio.sleep(0.1)  # Wait for device response
-                data = self._device.read(8, timeout=1000)
-
-                if not data:
-                    logger.warning("No status data received from device")
-                    return {}
-
-                # Parse status bit field
-                # Bit 0 = channel 1, bit 1 = channel 2, etc.
-                # Bit value: 1 = open/on, 0 = closed/off
-                status_byte = data[0] if data else 0
-                status = {}
-
-                for ch in range(1, self.num_channels + 1):
-                    bit = ch - 1
-                    status[ch] = bool(status_byte & (1 << bit))
-
-                return status
+                # Return copy of cache
+                return dict(self._state_cache)
 
             except Exception as e:
                 logger.error(f"Error getting relay status: {e}")
-                return {}
+                # Return cached state if available
+                return dict(self._state_cache) if self._state_cache else {}
 
     async def _reconnect_loop(self) -> None:
         """Background task for automatic reconnection"""
