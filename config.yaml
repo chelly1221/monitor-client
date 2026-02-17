@@ -2,12 +2,11 @@
 
 # USB Relay Device Settings
 relay:
-  # Device serial number (get this from the device label or enumeration)
-  # Example serial numbers: "AFED5", "A0001", etc.
-  serial_number: "AFED5"
+  # Device serial number (auto-detected if omitted)
+  # serial_number: "AFED5"
 
-  # Number of channels on the relay board (1, 2, 4, or 8)
-  channels: 8
+  # Number of channels on the relay board (auto-detected from product string if omitted)
+  # channels: 8
 
   # Automatic reconnection if device disconnects
   auto_reconnect: true
@@ -28,22 +27,6 @@ network:
     enabled: true
     host: "0.0.0.0"  # Listen on all interfaces
     port: 5001       # UDP port
-
-# Security Settings
-security:
-  # IP Address Whitelist
-  ip_whitelist:
-    # Enable whitelist filtering (set to true to restrict access)
-    enabled: false
-
-    # List of allowed IP addresses or CIDR networks
-    # Examples:
-    #   - "192.168.1.100"      # Single IP
-    #   - "192.168.1.0/24"     # Entire subnet
-    #   - "10.0.0.0/8"         # Large network
-    allowed_ips:
-      - "192.168.1.0/24"
-      - "127.0.0.1"
 
 # Logging Settings
 logging:

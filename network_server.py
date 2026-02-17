@@ -7,62 +7,11 @@ Both servers run in the same asyncio event loop.
 
 import asyncio
 import logging
-import ipaddress
-from typing import Optional, List, Set
+from typing import Optional
 from command_parser import CommandParser, Command, InvalidCommandError
 from usb_relay import USBRelayController
 
 logger = logging.getLogger(__name__)
-
-
-class IPWhitelist:
-    """IP address whitelist manager"""
-
-    def __init__(self, enabled: bool = False, allowed_ips: Optional[List[str]] = None):
-        """
-        Initialize IP whitelist
-
-        Args:
-            enabled: Enable whitelist filtering
-            allowed_ips: List of allowed IPs or CIDR networks (e.g., "192.168.1.0/24")
-        """
-        self.enabled = enabled
-        self.allowed_networks: Set[ipaddress.IPv4Network] = set()
-
-        if allowed_ips:
-            for ip_str in allowed_ips:
-                try:
-                    # Try to parse as network (CIDR notation)
-                    network = ipaddress.ip_network(ip_str, strict=False)
-                    self.allowed_networks.add(network)
-                except ValueError as e:
-                    logger.error(f"Invalid IP/network in whitelist: {ip_str} - {e}")
-
-        if self.enabled and self.allowed_networks:
-            logger.info(f"IP whitelist enabled with {len(self.allowed_networks)} entries")
-
-    def is_allowed(self, ip_address: str) -> bool:
-        """
-        Check if an IP address is allowed
-
-        Args:
-            ip_address: IP address to check
-
-        Returns:
-            bool: True if allowed
-        """
-        if not self.enabled:
-            return True
-
-        try:
-            ip = ipaddress.ip_address(ip_address)
-            for network in self.allowed_networks:
-                if ip in network:
-                    return True
-            return False
-        except ValueError:
-            logger.error(f"Invalid IP address: {ip_address}")
-            return False
 
 
 class RelayCommandHandler:
@@ -185,19 +134,17 @@ class RelayCommandHandler:
 class TCPServer:
     """Async TCP server for relay commands"""
 
-    def __init__(self, handler: RelayCommandHandler, whitelist: IPWhitelist,
+    def __init__(self, handler: RelayCommandHandler,
                  host: str = "0.0.0.0", port: int = 5000):
         """
         Initialize TCP server
 
         Args:
             handler: Command handler instance
-            whitelist: IP whitelist instance
             host: Bind host
             port: Bind port
         """
         self.handler = handler
-        self.whitelist = whitelist
         self.host = host
         self.port = port
         self._server: Optional[asyncio.Server] = None
@@ -218,13 +165,6 @@ class TCPServer:
         logger.info(f"TCP connection from {client_ip}:{client_port}")
 
         try:
-            # Check whitelist
-            if not self.whitelist.is_allowed(client_ip):
-                logger.warning(f"TCP connection rejected (not in whitelist): {client_ip}")
-                writer.write(b"ERROR: Access denied\n")
-                await writer.drain()
-                return
-
             # Read command (up to 1KB)
             data = await reader.read(1024)
 
@@ -274,16 +214,14 @@ class TCPServer:
 class UDPServer(asyncio.DatagramProtocol):
     """Async UDP server for relay commands"""
 
-    def __init__(self, handler: RelayCommandHandler, whitelist: IPWhitelist):
+    def __init__(self, handler: RelayCommandHandler):
         """
         Initialize UDP server
 
         Args:
             handler: Command handler instance
-            whitelist: IP whitelist instance
         """
         self.handler = handler
-        self.whitelist = whitelist
         self.transport: Optional[asyncio.DatagramTransport] = None
 
     def connection_made(self, transport: asyncio.DatagramTransport) -> None:
@@ -302,11 +240,6 @@ class UDPServer(asyncio.DatagramProtocol):
         client_port = addr[1]
 
         logger.debug(f"UDP datagram from {client_ip}:{client_port}")
-
-        # Check whitelist
-        if not self.whitelist.is_allowed(client_ip):
-            logger.warning(f"UDP datagram rejected (not in whitelist): {client_ip}")
-            return
 
         try:
             # Decode command
@@ -361,25 +294,17 @@ async def start_servers(relay_controller: USBRelayController,
     Returns:
         tuple: (tcp_server, udp_transport, udp_protocol)
     """
-    # Create parser
-    parser = CommandParser(max_channels=config['relay']['channels'])
+    # Create parser (use detected channel count from the controller)
+    parser = CommandParser(max_channels=relay_controller.num_channels)
 
     # Create command handler
     handler = RelayCommandHandler(relay_controller, parser)
-
-    # Create IP whitelist
-    whitelist_config = config.get('security', {}).get('ip_whitelist', {})
-    whitelist = IPWhitelist(
-        enabled=whitelist_config.get('enabled', False),
-        allowed_ips=whitelist_config.get('allowed_ips', [])
-    )
 
     # Start TCP server
     tcp_server = None
     if config['network']['tcp']['enabled']:
         tcp_server = TCPServer(
             handler,
-            whitelist,
             host=config['network']['tcp']['host'],
             port=config['network']['tcp']['port']
         )
@@ -391,7 +316,7 @@ async def start_servers(relay_controller: USBRelayController,
     if config['network']['udp']['enabled']:
         loop = asyncio.get_event_loop()
 
-        udp_protocol = UDPServer(handler, whitelist)
+        udp_protocol = UDPServer(handler)
 
         udp_transport, _ = await loop.create_datagram_endpoint(
             lambda: udp_protocol,

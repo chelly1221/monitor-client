@@ -57,14 +57,14 @@ class USBRelayController:
     # Special channel value for ALL channels
     ALL_CHANNELS = 255
 
-    def __init__(self, serial_number: str, num_channels: int = 8,
+    def __init__(self, serial_number: Optional[str] = None, num_channels: Optional[int] = None,
                  auto_reconnect: bool = True, reconnect_interval: int = 5):
         """
         Initialize USB Relay Controller
 
         Args:
-            serial_number: Device serial number (e.g., "AFED5")
-            num_channels: Number of channels (1, 2, 4, or 8)
+            serial_number: Device serial number (auto-detected if None)
+            num_channels: Number of channels (auto-detected if None)
             auto_reconnect: Enable automatic reconnection
             reconnect_interval: Seconds between reconnection attempts
         """
@@ -86,11 +86,36 @@ class USBRelayController:
         # Cache for current relay state (avoids constant HID queries)
         self._state_cache: Dict[int, bool] = {}
 
-        logger.info(f"Initialized USB Relay Controller for device {serial_number}")
+        if serial_number:
+            logger.info(f"Initialized USB Relay Controller for device {serial_number}")
+        else:
+            logger.info("Initialized USB Relay Controller with auto-detection")
+
+    @staticmethod
+    def _detect_channels(product_string: str) -> int:
+        """
+        Detect number of channels from the device product string.
+
+        Common product strings: "USBRelay1", "USBRelay2", "USBRelay4", "USBRelay8"
+
+        Args:
+            product_string: HID device product string
+
+        Returns:
+            int: Detected channel count (defaults to 8 if unknown)
+        """
+        import re
+        match = re.search(r'(\d+)$', product_string or '')
+        if match:
+            count = int(match.group(1))
+            if count in (1, 2, 4, 8):
+                return count
+        return 8
 
     async def connect(self) -> bool:
         """
-        Connect to USB relay device
+        Connect to USB relay device.
+        Auto-detects serial number and channel count if not provided.
 
         Returns:
             bool: True if connected successfully
@@ -108,27 +133,40 @@ class USBRelayController:
                         f"No USB relay devices found (VID:{self.VENDOR_ID:04x}, PID:{self.PRODUCT_ID:04x})"
                     )
 
-                # Find device by serial number
                 device_info = None
-                for dev in devices:
-                    serial = dev.get('serial_number', '')
-                    if serial == self.serial_number:
-                        device_info = dev
-                        break
 
-                if not device_info:
-                    available = [d.get('serial_number', 'Unknown') for d in devices]
-                    raise DeviceNotFoundError(
-                        f"Device with serial '{self.serial_number}' not found. "
-                        f"Available devices: {available}"
-                    )
+                if self.serial_number:
+                    # Find device by serial number
+                    for dev in devices:
+                        serial = dev.get('serial_number', '')
+                        if serial == self.serial_number:
+                            device_info = dev
+                            break
+
+                    if not device_info:
+                        available = [d.get('serial_number', 'Unknown') for d in devices]
+                        raise DeviceNotFoundError(
+                            f"Device with serial '{self.serial_number}' not found. "
+                            f"Available devices: {available}"
+                        )
+                else:
+                    # Auto-detect: use the first available device
+                    device_info = devices[0]
+                    self.serial_number = device_info.get('serial_number', '')
+                    logger.info(f"Auto-detected USB relay device: serial={self.serial_number}")
+
+                # Auto-detect channel count from product string if not specified
+                if self.num_channels is None:
+                    product = device_info.get('product_string', '')
+                    self.num_channels = self._detect_channels(product)
+                    logger.info(f"Auto-detected {self.num_channels} channels (product: {product})")
 
                 # Open the device
                 self._device = hid.Device(path=device_info['path'])
                 self._connected = True
                 self._reconnect_delay = self.reconnect_interval  # Reset backoff
 
-                logger.info(f"Connected to USB relay device: {self.serial_number}")
+                logger.info(f"Connected to USB relay device: {self.serial_number} ({self.num_channels}ch)")
 
                 # Initialize state cache
                 await self._update_state_cache()

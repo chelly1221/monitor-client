@@ -70,9 +70,6 @@ class RelayControllerApp:
         config['logging'].setdefault('level', 'INFO')
         config['logging'].setdefault('file', None)
 
-        config.setdefault('security', {})
-        config['security'].setdefault('ip_whitelist', {'enabled': False})
-
         return config
 
     def setup_logging(self) -> None:
@@ -126,8 +123,8 @@ class RelayControllerApp:
         relay_config = self.config['relay']
 
         self.relay_controller = USBRelayController(
-            serial_number=relay_config['serial_number'],
-            num_channels=relay_config.get('channels', 8),
+            serial_number=relay_config.get('serial_number'),
+            num_channels=relay_config.get('channels'),
             auto_reconnect=relay_config.get('auto_reconnect', True),
             reconnect_interval=relay_config.get('reconnect_interval', 5)
         )
