@@ -1,8 +1,9 @@
 """
-USB HID Relay Controller
+USB HID Relay Controller — Multi-Device Support
 
 This module provides an async interface to USB HID relay devices.
-Based on the reference USB relay API from the Windows C++ implementation.
+Automatically detects and manages ALL connected relay devices with
+the same VID/PID (16c0:05df). Commands are broadcast to all devices.
 
 Key API patterns from reference code:
 - Channel numbering: 1-8 (NOT 0-indexed)
@@ -17,8 +18,9 @@ USB HID relays (VID:16c0, PID:05df).
 
 import asyncio
 import logging
-import time
-from typing import Optional, Dict
+import re
+from typing import Optional, Dict, List
+
 import hid
 
 logger = logging.getLogger(__name__)
@@ -41,13 +43,11 @@ class InvalidChannelError(USBRelayError):
 
 class USBRelayController:
     """
-    USB HID Relay Controller
+    USB HID Relay Controller — Multi-Device Manager
 
-    Provides async interface to control USB HID relay devices.
-    Supports 1, 2, 4, or 8 channel relay boards.
-
-    Uses the common DCTTECH/USBRelay HID protocol compatible with
-    most USB HID relays using VID:16c0, PID:05df.
+    Automatically detects and manages all connected USB HID relay devices.
+    Commands are broadcast to every connected device simultaneously.
+    New devices are auto-detected; disconnected devices are auto-removed.
     """
 
     # Standard USB HID Relay VID/PID
@@ -57,39 +57,37 @@ class USBRelayController:
     # Special channel value for ALL channels
     ALL_CHANNELS = 255
 
+    # How often to scan for new/removed devices (seconds)
+    SCAN_INTERVAL = 3
+
     def __init__(self, serial_number: Optional[str] = None, num_channels: Optional[int] = None,
                  auto_reconnect: bool = True, reconnect_interval: int = 5):
         """
         Initialize USB Relay Controller
 
         Args:
-            serial_number: Device serial number (auto-detected if None)
-            num_channels: Number of channels (auto-detected if None)
-            auto_reconnect: Enable automatic reconnection
-            reconnect_interval: Seconds between reconnection attempts
+            serial_number: Ignored (kept for config compat). All devices are auto-detected.
+            num_channels: Override channel count. If None, auto-detected per device.
+            auto_reconnect: Enable background device scanning
+            reconnect_interval: Seconds between reconnection attempts (initial)
         """
-        self.serial_number = serial_number
-        self.num_channels = num_channels
+        self._configured_channels = num_channels
         self.auto_reconnect = auto_reconnect
         self.reconnect_interval = reconnect_interval
 
-        self._device: Optional[hid.Device] = None
-        self._connected = False
+        # Multi-device state: keyed by device path (bytes)
+        self._devices: Dict[bytes, hid.device] = {}
+        self._device_info: Dict[bytes, dict] = {}  # serial, channels, state_cache per device
+
         self._lock = asyncio.Lock()
-        self._reconnect_task: Optional[asyncio.Task] = None
+        self._monitor_task: Optional[asyncio.Task] = None
         self._shutdown = False
 
-        # Exponential backoff for reconnection
+        # Exponential backoff for when no devices found at all
         self._reconnect_delay = reconnect_interval
         self._max_reconnect_delay = 60
 
-        # Cache for current relay state (avoids constant HID queries)
-        self._state_cache: Dict[int, bool] = {}
-
-        if serial_number:
-            logger.info(f"Initialized USB Relay Controller for device {serial_number}")
-        else:
-            logger.info("Initialized USB Relay Controller with auto-detection")
+        logger.info("Initialized USB Relay Controller (multi-device mode)")
 
     @staticmethod
     def _detect_channels(product_string: str) -> int:
@@ -97,14 +95,7 @@ class USBRelayController:
         Detect number of channels from the device product string.
 
         Common product strings: "USBRelay1", "USBRelay2", "USBRelay4", "USBRelay8"
-
-        Args:
-            product_string: HID device product string
-
-        Returns:
-            int: Detected channel count (defaults to 8 if unknown)
         """
-        import re
         match = re.search(r'(\d+)$', product_string or '')
         if match:
             count = int(match.group(1))
@@ -112,306 +103,352 @@ class USBRelayController:
                 return count
         return 8
 
-    async def connect(self) -> bool:
+    @property
+    def num_channels(self) -> Optional[int]:
+        """Max channel count across all connected devices, or configured override."""
+        if self._configured_channels is not None:
+            return self._configured_channels
+        if not self._device_info:
+            return None
+        return max(info['channels'] for info in self._device_info.values())
+
+    @property
+    def is_connected(self) -> bool:
+        """True if at least one device is connected"""
+        return len(self._devices) > 0
+
+    @property
+    def device_count(self) -> int:
+        """Number of currently connected devices"""
+        return len(self._devices)
+
+    @property
+    def serial_number(self) -> Optional[str]:
+        """Return first device serial for backward compat, or None."""
+        if self._device_info:
+            first = next(iter(self._device_info.values()))
+            return first.get('serial', None)
+        return None
+
+    def _open_device(self, enum_info: dict) -> Optional[bytes]:
         """
-        Connect to USB relay device.
-        Auto-detects serial number and channel count if not provided.
-
-        Returns:
-            bool: True if connected successfully
-
-        Raises:
-            DeviceNotFoundError: If device not found
-        """
-        async with self._lock:
-            try:
-                # Enumerate HID devices
-                devices = hid.enumerate(self.VENDOR_ID, self.PRODUCT_ID)
-
-                if not devices:
-                    raise DeviceNotFoundError(
-                        f"No USB relay devices found (VID:{self.VENDOR_ID:04x}, PID:{self.PRODUCT_ID:04x})"
-                    )
-
-                device_info = None
-
-                if self.serial_number:
-                    # Find device by serial number
-                    for dev in devices:
-                        serial = dev.get('serial_number', '')
-                        if serial == self.serial_number:
-                            device_info = dev
-                            break
-
-                    if not device_info:
-                        available = [d.get('serial_number', 'Unknown') for d in devices]
-                        raise DeviceNotFoundError(
-                            f"Device with serial '{self.serial_number}' not found. "
-                            f"Available devices: {available}"
-                        )
-                else:
-                    # Auto-detect: use the first available device
-                    device_info = devices[0]
-                    self.serial_number = device_info.get('serial_number', '')
-                    logger.info(f"Auto-detected USB relay device: serial={self.serial_number}")
-
-                # Auto-detect channel count from product string if not specified
-                if self.num_channels is None:
-                    product = device_info.get('product_string', '')
-                    self.num_channels = self._detect_channels(product)
-                    logger.info(f"Auto-detected {self.num_channels} channels (product: {product})")
-
-                # Open the device
-                self._device = hid.Device(path=device_info['path'])
-                self._connected = True
-                self._reconnect_delay = self.reconnect_interval  # Reset backoff
-
-                logger.info(f"Connected to USB relay device: {self.serial_number} ({self.num_channels}ch)")
-
-                # Initialize state cache
-                await self._update_state_cache()
-
-                return True
-
-            except Exception as e:
-                self._connected = False
-                logger.error(f"Failed to connect to USB relay: {e}")
-                raise
-
-    async def disconnect(self) -> None:
-        """Disconnect from USB relay device"""
-        async with self._lock:
-            if self._device:
-                try:
-                    self._device.close()
-                    logger.info(f"Disconnected from USB relay device: {self.serial_number}")
-                except Exception as e:
-                    logger.error(f"Error during disconnect: {e}")
-                finally:
-                    self._device = None
-                    self._connected = False
-                    self._state_cache.clear()
-
-    def _validate_channel(self, channel: int) -> None:
-        """
-        Validate channel number
+        Open a single HID device and register it.
 
         Args:
-            channel: Channel number (1-8 or ALL_CHANNELS)
+            enum_info: Device info dict from hid.enumerate()
 
-        Raises:
-            InvalidChannelError: If channel is invalid
+        Returns:
+            Device path if opened successfully, None otherwise.
         """
+        path = enum_info['path']
+        if path in self._devices:
+            return None  # Already open
+
+        try:
+            dev = hid.device()
+            dev.open_path(path)
+
+            # Determine serial number
+            serial = enum_info.get('serial_number', '')
+            if not serial:
+                try:
+                    serial = dev.get_serial_number_string() or ''
+                except Exception:
+                    pass
+            if not serial:
+                try:
+                    report = dev.get_feature_report(0x01, 9)
+                    if report and len(report) >= 5:
+                        serial = bytes(report[:5]).decode('ascii', errors='ignore').strip('\x00')
+                except Exception:
+                    serial = 'unknown'
+
+            # Determine channel count
+            if self._configured_channels is not None:
+                channels = self._configured_channels
+            else:
+                try:
+                    product = dev.get_product_string() or ''
+                    channels = self._detect_channels(product)
+                except Exception:
+                    channels = 8
+
+            # Read initial state
+            state_cache: Dict[int, bool] = {}
+            try:
+                report = dev.get_feature_report(0x01, 9)
+                if report and len(report) >= 8:
+                    state_byte = report[7]
+                    for ch in range(1, channels + 1):
+                        state_cache[ch] = bool(state_byte & (1 << (ch - 1)))
+            except Exception:
+                pass
+
+            self._devices[path] = dev
+            self._device_info[path] = {
+                'serial': serial,
+                'channels': channels,
+                'state_cache': state_cache,
+            }
+
+            logger.info(f"Opened device: serial={serial}, channels={channels}, path={path}")
+            return path
+
+        except Exception as e:
+            logger.error(f"Failed to open device at {path}: {e}")
+            return None
+
+    def _close_device(self, path: bytes) -> None:
+        """Close and unregister a single device."""
+        dev = self._devices.pop(path, None)
+        self._device_info.pop(path, None)
+        if dev:
+            try:
+                dev.close()
+            except Exception:
+                pass
+
+    async def connect(self) -> bool:
+        """
+        Scan for and connect to all USB relay devices.
+
+        Returns:
+            bool: True if at least one device connected
+        Raises:
+            DeviceNotFoundError: If no devices found
+        """
+        async with self._lock:
+            enum_list = hid.enumerate(self.VENDOR_ID, self.PRODUCT_ID)
+
+            if not enum_list:
+                raise DeviceNotFoundError(
+                    f"No USB relay devices found (VID:{self.VENDOR_ID:04x}, PID:{self.PRODUCT_ID:04x})"
+                )
+
+            opened = 0
+            for info in enum_list:
+                if self._open_device(info) is not None:
+                    opened += 1
+
+            if not self._devices:
+                raise DeviceNotFoundError("Found devices but failed to open any")
+
+            self._reconnect_delay = self.reconnect_interval
+            logger.info(f"Connected to {len(self._devices)} device(s) (newly opened: {opened})")
+            return True
+
+    async def disconnect(self) -> None:
+        """Disconnect from all USB relay devices"""
+        async with self._lock:
+            paths = list(self._devices.keys())
+            for path in paths:
+                self._close_device(path)
+            logger.info("Disconnected from all USB relay devices")
+
+    def _validate_channel(self, channel: int) -> None:
+        """Validate channel number against max channels across all devices."""
         if channel == self.ALL_CHANNELS:
             return
-
-        if not (1 <= channel <= self.num_channels):
+        nc = self.num_channels
+        if nc is None:
+            raise DeviceNotFoundError("No devices connected")
+        if not (1 <= channel <= nc):
             raise InvalidChannelError(
-                f"Channel {channel} is invalid. "
-                f"Valid range: 1-{self.num_channels} or {self.ALL_CHANNELS} for all"
+                f"Channel {channel} is invalid. Valid range: 1-{nc} or {self.ALL_CHANNELS} for all"
             )
 
     async def _send_relay_command(self, channel: int, state: bool) -> bool:
         """
-        Send relay control command using DCTTECH/USBRelay protocol
-
-        Protocol: 9-byte feature report
-        [0] = 0x00 (report ID)
-        [1] = state (0xFE=off, 0xFF=on)
-        [2] = channel number (1-8)
-        [3-8] = 0x00 (padding)
-
-        Args:
-            channel: Channel number (1-8)
-            state: True=ON/OPEN, False=OFF/CLOSED
+        Send relay control command to ALL connected devices.
 
         Returns:
-            bool: True if successful
+            bool: True if at least one device succeeded
         """
-        if not self._connected or not self._device:
-            raise DeviceNotFoundError("Device not connected")
+        if not self._devices:
+            raise DeviceNotFoundError("No devices connected")
 
-        try:
-            # Build HID feature report (DCTTECH protocol)
-            # Report format: [0x00, state_byte, channel, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00]
-            state_byte = 0xFF if state else 0xFE
-            report = bytes([0x00, state_byte, channel, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00])
+        state_byte = 0xFF if state else 0xFD
+        report = [0x00, state_byte, channel, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00]
 
-            # Send feature report
-            self._device.send_feature_report(report)
+        any_success = False
+        failed_paths: List[bytes] = []
 
-            # Small delay for relay to actuate
+        for path, dev in list(self._devices.items()):
+            try:
+                dev.send_feature_report(report)
+                # Update per-device state cache
+                info = self._device_info.get(path)
+                if info:
+                    info['state_cache'][channel] = state
+                any_success = True
+            except Exception as e:
+                serial = self._device_info.get(path, {}).get('serial', '?')
+                logger.error(f"Error sending command to device [{serial}]: {e}")
+                failed_paths.append(path)
+
+        # Remove failed devices
+        for path in failed_paths:
+            serial = self._device_info.get(path, {}).get('serial', '?')
+            logger.warning(f"Removing failed device [{serial}]")
+            self._close_device(path)
+
+        if any_success:
             await asyncio.sleep(0.05)
 
-            # Update cache
-            self._state_cache[channel] = state
-
-            return True
-
-        except Exception as e:
-            logger.error(f"Error sending relay command: {e}")
-            self._connected = False
-            if self.auto_reconnect:
-                asyncio.create_task(self._reconnect_loop())
-            return False
+        return any_success
 
     async def open_channel(self, channel: int) -> bool:
-        """
-        Open (activate) a relay channel
-
-        Args:
-            channel: Channel number (1-8)
-
-        Returns:
-            bool: True if successful
-        """
+        """Open (activate) a relay channel on all devices"""
         async with self._lock:
             self._validate_channel(channel)
             logger.debug(f"Opening channel {channel}")
             return await self._send_relay_command(channel, True)
 
     async def close_channel(self, channel: int) -> bool:
-        """
-        Close (deactivate) a relay channel
-
-        Args:
-            channel: Channel number (1-8)
-
-        Returns:
-            bool: True if successful
-        """
+        """Close (deactivate) a relay channel on all devices"""
         async with self._lock:
             self._validate_channel(channel)
             logger.debug(f"Closing channel {channel}")
             return await self._send_relay_command(channel, False)
 
     async def open_all_channels(self) -> bool:
-        """
-        Open (activate) all relay channels
-
-        Returns:
-            bool: True if successful
-        """
+        """Open all relay channels on all devices"""
         async with self._lock:
+            nc = self.num_channels
+            if nc is None:
+                raise DeviceNotFoundError("No devices connected")
             logger.debug("Opening all channels")
             success = True
-            for ch in range(1, self.num_channels + 1):
+            for ch in range(1, nc + 1):
                 if not await self._send_relay_command(ch, True):
                     success = False
             return success
 
     async def close_all_channels(self) -> bool:
-        """
-        Close (deactivate) all relay channels
-
-        Returns:
-            bool: True if successful
-        """
+        """Close all relay channels on all devices"""
         async with self._lock:
+            nc = self.num_channels
+            if nc is None:
+                raise DeviceNotFoundError("No devices connected")
             logger.debug("Closing all channels")
             success = True
-            for ch in range(1, self.num_channels + 1):
+            for ch in range(1, nc + 1):
                 if not await self._send_relay_command(ch, False):
                     success = False
             return success
 
-    async def _update_state_cache(self) -> None:
-        """Update the state cache by reading from device"""
-        if not self._connected or not self._device:
-            return
-
-        try:
-            # Request status using feature report
-            # Send: [0x00, 0x00, 0x00, ...]
-            # Receive: [channel_states, ...]
-            report = self._device.get_feature_report(0x00, 9)
-
-            if report and len(report) > 0:
-                # First byte contains relay states as bit field
-                state_byte = report[0]
-
-                # Update cache: bit 0 = channel 1, bit 1 = channel 2, etc.
-                for ch in range(1, self.num_channels + 1):
-                    bit = ch - 1
-                    self._state_cache[ch] = bool(state_byte & (1 << bit))
-
-        except Exception as e:
-            logger.warning(f"Failed to update state cache: {e}")
-
-    async def get_status(self) -> Dict[int, bool]:
+    async def _update_device_state(self, path: bytes) -> bool:
         """
-        Get status of all relay channels
+        Update state cache for a single device by reading its feature report.
 
         Returns:
-            Dict mapping channel number to state (True=open, False=closed)
+            True if successful, False if device is dead.
+        """
+        dev = self._devices.get(path)
+        info = self._device_info.get(path)
+        if not dev or not info:
+            return False
+
+        try:
+            report = dev.get_feature_report(0x01, 9)
+            if report and len(report) >= 8:
+                state_byte = report[7]
+                for ch in range(1, info['channels'] + 1):
+                    info['state_cache'][ch] = bool(state_byte & (1 << (ch - 1)))
+            return True
+        except Exception:
+            return False
+
+    async def get_status(self) -> Dict[str, Dict[int, bool]]:
+        """
+        Get status of all relay channels on all devices.
+
+        Returns:
+            Dict mapping device serial to {channel: state} dict.
+            Example: {"959BI": {1: True, 2: False}, "ABCDE": {1: False, 2: True}}
         """
         async with self._lock:
-            if not self._connected or not self._device:
-                raise DeviceNotFoundError("Device not connected")
+            if not self._devices:
+                raise DeviceNotFoundError("No devices connected")
 
-            try:
-                # Update cache from device
-                await self._update_state_cache()
+            result: Dict[str, Dict[int, bool]] = {}
+            failed_paths: List[bytes] = []
 
-                # Return copy of cache
-                return dict(self._state_cache)
+            for path in list(self._devices.keys()):
+                info = self._device_info.get(path)
+                if not info:
+                    continue
 
-            except Exception as e:
-                logger.error(f"Error getting relay status: {e}")
-                # Return cached state if available
-                return dict(self._state_cache) if self._state_cache else {}
+                if await self._update_device_state(path):
+                    result[info['serial']] = dict(info['state_cache'])
+                else:
+                    failed_paths.append(path)
 
-    async def _reconnect_loop(self) -> None:
-        """Background task for automatic reconnection"""
-        if self._reconnect_task and not self._reconnect_task.done():
-            return  # Reconnection already in progress
+            for path in failed_paths:
+                serial = self._device_info.get(path, {}).get('serial', '?')
+                logger.warning(f"Removing unresponsive device [{serial}]")
+                self._close_device(path)
 
-        self._reconnect_task = asyncio.current_task()
+            if not result and not self._devices:
+                raise DeviceNotFoundError("All devices became unresponsive")
 
-        while self.auto_reconnect and not self._shutdown:
-            if self._connected:
-                await asyncio.sleep(1)
-                continue
+            return result
 
-            try:
-                logger.info(f"Attempting to reconnect (retry in {self._reconnect_delay}s)...")
-                await asyncio.sleep(self._reconnect_delay)
+    async def _monitor_loop(self) -> None:
+        """
+        Background task: health-check existing devices and scan for new ones.
+        Runs every SCAN_INTERVAL seconds.
+        """
+        while not self._shutdown:
+            await asyncio.sleep(self.SCAN_INTERVAL)
+            if self._shutdown:
+                break
 
-                await self.connect()
+            async with self._lock:
+                # 1) Health-check existing devices
+                failed_paths: List[bytes] = []
+                for path, dev in list(self._devices.items()):
+                    try:
+                        dev.get_feature_report(0x01, 9)
+                    except Exception:
+                        failed_paths.append(path)
 
-                if self._connected:
-                    logger.info("Reconnected successfully!")
-                    self._reconnect_delay = self.reconnect_interval
-                    break
+                for path in failed_paths:
+                    serial = self._device_info.get(path, {}).get('serial', '?')
+                    logger.warning(f"Device [{serial}] health check failed, removing")
+                    self._close_device(path)
 
-            except Exception as e:
-                logger.warning(f"Reconnection attempt failed: {e}")
-                # Exponential backoff
-                self._reconnect_delay = min(
-                    self._reconnect_delay * 2,
-                    self._max_reconnect_delay
-                )
+                # 2) Scan for new devices
+                try:
+                    enum_list = hid.enumerate(self.VENDOR_ID, self.PRODUCT_ID)
+                    for info in enum_list:
+                        if info['path'] not in self._devices:
+                            result = self._open_device(info)
+                            if result:
+                                serial = self._device_info[result]['serial']
+                                logger.info(f"New device detected and opened: [{serial}]")
+                except Exception as e:
+                    logger.debug(f"Device scan error: {e}")
+
+    async def start_monitor(self) -> None:
+        """Start the background device monitor task"""
+        if self.auto_reconnect and (self._monitor_task is None or self._monitor_task.done()):
+            self._monitor_task = asyncio.create_task(self._monitor_loop())
 
     async def start_reconnect_monitor(self) -> None:
-        """Start the reconnection monitor background task"""
-        if self.auto_reconnect:
-            asyncio.create_task(self._reconnect_loop())
+        """Alias for start_monitor"""
+        await self.start_monitor()
 
     async def shutdown(self) -> None:
         """Shutdown the controller and cleanup resources"""
         logger.info("Shutting down USB relay controller")
         self._shutdown = True
 
-        if self._reconnect_task:
-            self._reconnect_task.cancel()
+        if self._monitor_task:
+            self._monitor_task.cancel()
             try:
-                await self._reconnect_task
+                await self._monitor_task
             except asyncio.CancelledError:
                 pass
 
         await self.disconnect()
-
-    @property
-    def is_connected(self) -> bool:
-        """Check if device is currently connected"""
-        return self._connected

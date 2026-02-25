@@ -1,193 +1,63 @@
-# AI-Assisted Development with Claude
+# USB HID Relay Network Controller
 
-This project was developed with assistance from Claude (Anthropic's AI assistant) using Claude Code CLI.
+## 프로젝트 개요
 
-## Development Session
+USB HID 릴레이 장치를 TCP/UDP 네트워크 명령으로 제어하는 Python asyncio 기반 프로그램.
+같은 VID/PID(16c0:05df) 장치를 여러 개 꽂으면 전부 자동 감지해서 동시에 동일하게 제어.
 
-**Date**: February 16, 2026
-**Claude Model**: Claude Sonnet 4.5
-**Development Tool**: Claude Code CLI (Plan Mode + Implementation)
+## 실행 환경
 
-## Project Requirements
+- **플랫폼**: DietPi (Debian Linux, ARM64)
+- **실행 방식**: systemd 서비스 (`relay-controller.service`)
+- **Python**: 3.x + asyncio
+- **USB 장치**: HID USB Relay (VID:16c0, PID:05df)
 
-The user requested a simple program to control a USB relay when receiving TCP or UDP messages from the network, with the following specifications:
+## 파일 구조
 
-- **Platform**: DietPi (Debian-based Linux)
-- **Deployment**: Docker with docker-compose
-- **Language**: Python with asyncio
-- **USB Device**: HID USB relay (based on provided Windows C++ reference code)
-- **Network**: Both TCP and UDP servers simultaneously
-- **Commands**: Plain text format (e.g., "OPEN 1", "CLOSE ALL", "STATUS")
-- **Configuration**: YAML file in base directory
+| 파일 | 역할 |
+|------|------|
+| `relay_controller.py` | 메인 앱 (설정 로드, 컴포넌트 조율, 시그널 핸들링) |
+| `usb_relay.py` | USB HID 다중 장치 관리자 (자동 감지, 브로드캐스트, 핫플러그) |
+| `network_server.py` | TCP/UDP 서버 (명령 수신, 실행, 응답) |
+| `command_parser.py` | 명령어 파싱/검증 (OPEN, CLOSE, STATUS, TOGGLE, HELP) |
+| `config.yaml` | 런타임 설정 (포트, 로깅 등) |
+| `requirements.txt` | Python 의존성 (pyyaml, hidapi, aiofiles) |
 
-## Development Process
+## 핵심 설계
 
-### 1. Planning Phase
-Claude entered plan mode to:
-- Analyze the reference USB relay code (Windows C++ implementation)
-- Understand the USB HID relay API patterns
-- Research Python libraries for Linux HID device access
-- Design the application architecture
-- Create a comprehensive implementation plan
+### 다중 장치 관리 (`usb_relay.py`)
+- `_devices: Dict[bytes, hid.device]` — HID path를 key로 열린 장치 관리
+- `_device_info: Dict[bytes, dict]` — 장치별 serial, channels, state_cache
+- `_monitor_loop()`: 3초마다 health check + 새 장치 스캔
+- `_send_relay_command()`: 모든 열린 장치에 명령 브로드캐스트
+- `get_status()`: `Dict[serial, Dict[channel, bool]]` 반환
+- 실패한 장치는 즉시 제거, 새 장치는 자동 추가
 
-Key decisions made during planning:
-- Use Python `hidapi` library for USB HID communication
-- Use `asyncio` for concurrent TCP/UDP handling
-- Implement auto-reconnection for USB device reliability
-- Docker containerization for easy deployment
-- Plain text command protocol for simplicity
+### 명령어 프로토콜 (`command_parser.py`)
+- `OPEN` → 모든 채널 열기 (target 생략 시 ALL)
+- `CLOSE` → 모든 채널 닫기 (target 생략 시 ALL)
+- `OPEN <ch>` / `CLOSE <ch>` → 특정 채널
+- `STATUS` → 장치별 상태 (`[serial] CH1=OPEN,...`)
+- `TOGGLE <ch>` → 첫 번째 장치 기준으로 토글 방향 결정
 
-### 2. Implementation Phase
-Claude implemented the following components:
+### 네트워크 서버 (`network_server.py`)
+- TCP (기본 5000) / UDP (기본 5001) 동시 운영
+- asyncio 이벤트 루프 하나에서 모두 처리
 
-#### Core Application
-1. **usb_relay.py** - USB HID device controller with:
-   - Async device operations
-   - Auto-reconnection with exponential backoff
-   - Thread-safe operations using asyncio locks
-   - Support for 1, 2, 4, or 8 channel relay boards
+### HID 프로토콜
+- Feature report 9바이트: `[0x00, state, channel, 0x00, ...]`
+- ON=0xFF, OFF=0xFD
+- 상태 읽기: feature report byte[7] 비트필드
 
-2. **command_parser.py** - Command parser with:
-   - Plain text command parsing (OPEN, CLOSE, STATUS, TOGGLE, HELP)
-   - Input validation
-   - Channel bounds checking
-   - Clear error messages
+## 서비스 관리
 
-3. **network_server.py** - Network servers with:
-   - Concurrent TCP and UDP servers in single event loop
-   - IP whitelist support for security
-   - Command routing and execution
-   - Connection logging
+```bash
+sudo systemctl restart relay-controller   # 재시작
+sudo systemctl status relay-controller    # 상태
+sudo journalctl -u relay-controller -f    # 로그
+```
 
-4. **relay_controller.py** - Main application with:
-   - Configuration loading from YAML
-   - Component orchestration
-   - Logging setup with rotation
-   - Signal handling for graceful shutdown
+## 개발 이력
 
-#### Docker Deployment
-5. **Dockerfile** - Container image with:
-   - Python 3.11 slim base
-   - System dependencies for USB HID
-   - Non-root user for security
-   - Health check
-
-6. **docker-compose.yml** - Service orchestration with:
-   - Privileged mode for USB access
-   - Port mapping for TCP/UDP
-   - Volume mounting for config and logs
-   - Auto-restart policy
-
-#### Configuration & Documentation
-7. **config.yaml** - Example configuration
-8. **requirements.txt** - Python dependencies
-9. **.dockerignore** - Build exclusions
-10. **README.md** - Comprehensive documentation with:
-    - Quick start guide
-    - Command reference
-    - Usage examples
-    - Troubleshooting
-    - Architecture overview
-
-## Technical Highlights
-
-### USB HID Communication
-- Based on reference code patterns from Windows C++ implementation
-- Channel numbering: 1-8 (not 0-indexed) to match hardware API
-- Special value 255 for ALL channels
-- Status returned as bit field
-
-### Async Architecture
-- Single asyncio event loop for all I/O operations
-- Non-blocking concurrent TCP and UDP handling
-- Efficient use of Python's asyncio primitives
-- Proper cleanup and graceful shutdown
-
-### Docker Integration
-- Privileged mode for USB device access
-- Alternative device mapping option for better security
-- Read-only config mounting
-- Persistent log storage
-- Health checks
-
-### Error Handling
-- USB device auto-reconnection with exponential backoff
-- Network error recovery
-- Input validation and sanitization
-- Comprehensive logging
-
-## Reference Materials Analyzed
-
-Claude analyzed the provided reference code:
-- **usb_relay_device.h** - USB relay API header file
-- **CommandApp_USBRelay.cpp** - Windows command-line application
-- **How to use the library.txt** - API usage instructions
-
-Key insights from reference code:
-- Device enumeration and serial number matching
-- Command codes and return values
-- Channel numbering convention
-- Status bit field format
-
-## Code Quality
-
-The implementation includes:
-- **Type hints** throughout the codebase
-- **Docstrings** for all classes and functions
-- **Error handling** with custom exception classes
-- **Logging** at appropriate levels
-- **Configuration validation**
-- **Security considerations** (IP whitelist, non-root container)
-
-## Testing Recommendations
-
-The README includes manual testing procedures:
-- Docker build and deployment
-- TCP command testing with netcat
-- UDP command testing with netcat
-- USB device reconnection testing
-- Container lifecycle testing
-- Log verification
-
-## Deployment
-
-The application is ready for deployment on DietPi with:
-1. Docker and docker-compose installed
-2. USB relay device connected
-3. Configuration file updated with device serial number
-4. Simple `docker-compose up -d` command
-
-## Future Enhancement Ideas
-
-Documented in README for potential future development:
-- Authentication (password/token-based)
-- Web dashboard for control
-- MQTT integration for home automation
-- Scheduling and timer-based control
-- Multiple USB relay device support
-- WebSocket for real-time status push
-- Prometheus metrics endpoint
-
-## Files Generated
-
-Total of 10 files created:
-- 4 Python modules (usb_relay.py, command_parser.py, network_server.py, relay_controller.py)
-- 3 Docker files (Dockerfile, docker-compose.yml, .dockerignore)
-- 3 Configuration/documentation files (config.yaml, requirements.txt, README.md)
-- Plus this CLAUDE.md file
-
-## Total Development Time
-
-The entire project from requirements gathering through complete implementation and documentation was completed in a single Claude Code session.
-
-## Claude Code Features Used
-
-- **Plan Mode**: For analyzing requirements and designing architecture
-- **Explore Agent**: For examining reference code
-- **Plan Agent**: For detailed implementation planning
-- **Code Generation**: For implementing all modules
-- **Documentation**: For comprehensive README and configuration
-
----
-
-**Note**: While this project was AI-assisted, all code has been designed to be maintainable, well-documented, and follows Python best practices. The implementation is production-ready for controlling USB HID relay devices via network commands.
+- 2026-02-16: 초기 구현 (단일 장치, Docker 배포)
+- 2026-02-25: 다중 장치 동시 지원, Docker 제거, systemd 전환, 명령어 간소화

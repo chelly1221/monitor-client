@@ -81,10 +81,14 @@ class RelayCommandHandler:
             if not status:
                 return "ERROR: Unable to get relay status"
 
-            # Format status response
-            status_parts = [f"CH{ch}={'OPEN' if state else 'CLOSED'}"
-                           for ch, state in sorted(status.items())]
-            return "STATUS: " + ",".join(status_parts)
+            # Format per-device status response
+            # status is Dict[serial, Dict[channel, bool]]
+            parts = []
+            for serial, channels in sorted(status.items()):
+                ch_parts = [f"CH{ch}={'OPEN' if state else 'CLOSED'}"
+                            for ch, state in sorted(channels.items())]
+                parts.append(f"[{serial}] " + ",".join(ch_parts))
+            return "STATUS: " + " | ".join(parts)
 
         # Handle OPEN
         if command.is_open:
@@ -112,19 +116,21 @@ class RelayCommandHandler:
             if not channel:
                 return "ERROR: TOGGLE requires a channel number"
 
-            # Get current status
+            # Get current status (per-device dict)
             status = await self.relay.get_status()
-            if channel not in status:
+            if not status:
                 return f"ERROR: Cannot get status for channel {channel}"
 
-            # Toggle the channel
-            current_state = status[channel]
+            # Use first device's state as reference for toggle direction
+            first_device_channels = next(iter(status.values()))
+            if channel not in first_device_channels:
+                return f"ERROR: Cannot get status for channel {channel}"
+
+            current_state = first_device_channels[channel]
             if current_state:
-                # Currently open, so close it
                 success = await self.relay.close_channel(channel)
                 return "OK" if success else f"ERROR: Failed to close channel {channel}"
             else:
-                # Currently closed, so open it
                 success = await self.relay.open_channel(channel)
                 return "OK" if success else f"ERROR: Failed to open channel {channel}"
 
@@ -294,8 +300,8 @@ async def start_servers(relay_controller: USBRelayController,
     Returns:
         tuple: (tcp_server, udp_transport, udp_protocol)
     """
-    # Create parser (use detected channel count from the controller)
-    parser = CommandParser(max_channels=relay_controller.num_channels)
+    # Create parser (use detected channel count from the controller, default 8)
+    parser = CommandParser(max_channels=relay_controller.num_channels or 8)
 
     # Create command handler
     handler = RelayCommandHandler(relay_controller, parser)

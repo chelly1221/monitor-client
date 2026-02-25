@@ -34,7 +34,7 @@ logging:
   level: "INFO"
 
   # Log file path (set to null to disable file logging)
-  file: "/var/log/relay-controller.log"
+  file: "relay-controller.log"
 
   # Maximum log file size in MB before rotation
   max_size_mb: 10

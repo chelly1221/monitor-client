@@ -81,22 +81,23 @@ class CommandParser:
     """
 
     VALID_ACTIONS = {"OPEN", "CLOSE", "STATUS", "TOGGLE", "HELP"}
-    CHANNEL_ACTIONS = {"OPEN", "CLOSE", "TOGGLE"}  # Actions that require a target
+    CHANNEL_ACTIONS = {"OPEN", "CLOSE", "TOGGLE"}  # Actions that accept a target
     NO_TARGET_ACTIONS = {"STATUS", "HELP"}  # Actions that don't need a target
 
     HELP_TEXT = """Available Commands:
+OPEN             - Open (activate) all relay channels
 OPEN <channel>   - Open (activate) relay channel 1-8
+CLOSE            - Close (deactivate) all relay channels
 CLOSE <channel>  - Close (deactivate) relay channel 1-8
-OPEN ALL         - Open all relay channels
-CLOSE ALL        - Close all relay channels
 STATUS           - Get status of all relay channels
 TOGGLE <channel> - Toggle a specific relay channel
 HELP             - Show this help message
 
 Examples:
+  OPEN
+  CLOSE
   OPEN 1
   CLOSE 3
-  OPEN ALL
   STATUS
 """
 
@@ -153,11 +154,15 @@ Examples:
             return Command(action=action, target=None, raw_command=raw)
 
         elif action in self.CHANNEL_ACTIONS:
-            # OPEN, CLOSE, TOGGLE - require a target
+            # OPEN, CLOSE, TOGGLE - optional target (defaults to ALL for OPEN/CLOSE)
             if len(parts) < 2:
-                raise InvalidCommandError(
-                    f"{action} requires a channel number or ALL. Example: {action} 1"
-                )
+                if action in ("OPEN", "CLOSE"):
+                    # OPEN/CLOSE without target = ALL channels
+                    return Command(action=action, target="ALL", raw_command=raw)
+                else:
+                    raise InvalidCommandError(
+                        f"{action} requires a channel number. Example: {action} 1"
+                    )
 
             target = parts[1]
 

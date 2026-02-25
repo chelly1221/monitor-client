@@ -132,12 +132,12 @@ class RelayControllerApp:
         try:
             await self.relay_controller.connect()
         except DeviceNotFoundError as e:
-            logging.error(f"USB relay device not found: {e}")
-            if self.relay_controller.auto_reconnect:
-                logging.info("Auto-reconnect enabled, will retry in background...")
-                await self.relay_controller.start_reconnect_monitor()
-            else:
+            logging.warning(f"USB relay device not found: {e}")
+            if not self.relay_controller.auto_reconnect:
                 raise
+
+        # Always start monitor for health check and auto-reconnect
+        await self.relay_controller.start_monitor()
 
     async def start_network_servers(self) -> None:
         """Start TCP and UDP network servers"""
